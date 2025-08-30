@@ -24,10 +24,17 @@ import tempfile
 import threading
 import itertools
 import subprocess
+import pandas as pd
 from datetime import datetime
 
 
 script_dir = os.path.dirname(os.path.abspath(__file__))  # this script directory
+
+# Configure pandas to show full data-frames when printed:
+pd.set_option('display.max_columns', None)  # show all columns
+pd.set_option('display.max_rows', None)     # show all rows
+pd.set_option('display.width', None)        # don't wrap wide tables
+pd.set_option('display.max_colwidth', None) # show full content of each column
 
 
 class gen_dts_defines:
@@ -54,8 +61,9 @@ class gen_dts_defines:
 		stm32_series = sorted(set(stm32_series))
 		self._stm32_series = dict(zip(stm32_series, [[]]*len(stm32_series)))
 
-		# For all series list SoCs:
-		for s, _ in self._stm32_series.items():
+		# For all series list SoCs and add them to data-frame:
+		self._stm32_series_df = pd.DataFrame(columns=['series','soc', 'cpu-list'])
+		for s in stm32_series:
 			soc_dir = os.path.join(self._stm32cube_path, f'stm32{s}xx', 'soc')
 			soc_list = [soc.split('_')[0][5:-2] for soc in os.listdir(soc_dir) \
 						if soc.startswith('stm32')]
@@ -63,17 +71,33 @@ class gen_dts_defines:
 			soc_list.remove(s.upper() + 'xx')  # remove general series name
 			soc_list = sorted(set(soc_list))
 			self._stm32_series[s] = soc_list
+			for soc in soc_list:
+				self._stm32_series_df.loc[len(self._stm32_series_df)] =\
+					{'series': s, 'soc': soc, 'cpu-list': None}
+		self._stm32_series_df.sort_values('series', inplace=True)
+		self._stm32_series_df.reset_index(drop=True, inplace=True)
 
-		# Kep only u375xx and u385xx sub-series for u3 series:
+		# Keep only u375xx and u385xx sub-series for u3 series:
 		for s, _ in self._stm32_series.items():
 			if s.lower() == 'u3':
 				self._stm32_series[s] = [ss for ss in self._stm32_series[s] \
 										if ss.lower() in ['u375xx', 'u385xx']]
 
+		# Keep only u375xx and u385xx soc-names for u3 series in dataframe:
+		self._stm32_series_df = self._stm32_series_df[
+			~((self._stm32_series_df['series'].str.lower() == 'u3') & \
+			  (~self._stm32_series_df['soc'].str.lower().isin(['u375xx', 'u385xx'])))]
+		self._stm32_series_df.reset_index(drop=True, inplace=True)
+
 		# For mp1, mp13 and mp2 series add 'xx' suffix to sub-series names:
 		for s, _ in self._stm32_series.items():
 			if s.lower() in ['mp1', 'mp13', 'mp2']:
 				self._stm32_series[s] = [ss + 'xx' for ss in self._stm32_series[s]]
+
+		# For mp1, mp13 and mp2 series add 'xx' suffix to soc values in dataframe:
+		mp_series = ['mp1', 'mp13', 'mp2']
+		for s in mp_series:
+			self._stm32_series_df.loc[self._stm32_series_df['series'].str.lower() == s, 'soc'] += 'xx'
 
 		# For l1 series last x charater shall be capitalized:
 		for s, _ in self._stm32_series.items():
@@ -81,7 +105,10 @@ class gen_dts_defines:
 				self._stm32_series[s] = [ss[:-1] + 'X' if ss.endswith('x') else ss \
 										for ss in self._stm32_series[s]]
 
-		self._lg.info(f'Identified stm32 series:\n{self._stm32_series_pretty_str}')
+		# For l1 series last x charater shall be capitalized in dataframe:
+		self._stm32_series_df.loc[self._stm32_series_df['series'].str.lower() == 'l1', 'soc'] = \
+			self._stm32_series_df.loc[self._stm32_series_df['series'].str.lower() == 'l1', 'soc'].apply(
+				lambda x: x[:-1] + 'X' if x.endswith('x') else x)
 
 		# Since this script extracts SoC peripherals defines from headers, there
 		# is no interest in CPU headers used as a sub-dependency. Thus the CPU
@@ -97,6 +124,11 @@ class gen_dts_defines:
 			header_path = os.path.join(self._core_headers_tmp_dir, header + '.h')
 			with open(header_path, 'w', encoding='utf-8'): pass
 			self._lg.info(f'Created dummy header {header_path}')
+
+		self._stm32_series_df['cpu-list'] = [self._arm_cpu_names] * len(self._stm32_series_df)
+
+		self._lg.info(f'Identified stm32 series:\n{self._stm32_series_pretty_str}')
+		self._lg.info(f'Identified stm32 series:\n{self._stm32_series_df}')
 
 	def __del__(self):
 		shutil.rmtree(self._core_headers_tmp_dir)
