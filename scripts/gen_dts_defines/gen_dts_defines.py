@@ -97,66 +97,44 @@ class gen_dts_defines:
 			self._stm32_series_df.loc[self._stm32_series_df['series'].str.lower() == 'l1', 'soc'].apply(
 				lambda x: x[:-1] + 'X' if x.endswith('x') else x)
 
-		self._core_headers_tmp_dir = None
+		self._headers_tmp_dir = None
 
 		self._stm32_series_df = self._stm32_series_df.drop_duplicates(subset=['soc'])
 		self._stm32_series_df.sort_values('series', inplace=True)
 		self._stm32_series_df.reset_index(drop=True, inplace=True)
 
 	def __del__(self):
-		if self._core_headers_tmp_dir != None:
-			if os.path.exists(self._core_headers_tmp_dir):
-				shutil.rmtree(self._core_headers_tmp_dir)
-				self._lg.info(f'Removed folder: {self._core_headers_tmp_dir}')
+		if self._headers_tmp_dir != None:
+			if os.path.exists(self._headers_tmp_dir):
+				shutil.rmtree(self._headers_tmp_dir)
+				self._lg.info(f'Removed folder: {self._headers_tmp_dir}')
 
 	@staticmethod
 	def _filter_defines_dump(logger: logging.Logger, def_dump_str: str) -> pd.DataFrame:
 		def_dump_list = def_dump_str.split('\n')
-		not_visit_idx:int = -1
-		def_df = pd.DataFrame(list(zip([not_visit_idx] * len(def_dump_list),
-			[None] * len(def_dump_list), [None] * len(def_dump_list),
+		def_df = pd.DataFrame(list(zip([None] * len(def_dump_list), [None] * len(def_dump_list),
 			[None] * len(def_dump_list), [None] * len(def_dump_list), def_dump_list)),
-			columns=['visit-idx', 'key', 'value', 'val-split-op', 'val-split-op-replacement', 'line'])
+			columns=['key', 'value', 'val-split-op', 'val-split-op-replacement', 'line'])
 
 		def_df = def_df[def_df['line'] != '']  # drop lines with an empty string
 		def_df[['key', 'value']] = def_df['line'].apply(lambda l:
 				pd.Series(l.strip()[len('#define '):].split(' ',1)))  # form value and key columns
 
 		def_df = def_df[~def_df['key'].str.startswith('_')]  # filter out keys starting with _
+		def_df = def_df[~def_df['key'].str.islower()]  # filter out keys starting with lower-case letter
+		def_df = def_df[~def_df['key'].str.startswith('CORE_')]  # filter out keys starting with CORE_
 		def_df = def_df[~def_df['key'].str.contains(r'\(|\)')]  # filter out function-like macros
-		# def_df.drop('line', axis=1, inplace=True)  # drop line column (optional since make execution slightly slower)
-		def_df.sort_values('key', inplace=True)
 
 		def_df = def_df[def_df['value'].notna()]  # drop all rows, where value is undefined
 		def_df['value'] = def_df['value'].apply(lambda v: v.replace(' ', ''))  # remove spaces
 		def_df['value'] = def_df['value'].apply(lambda v: re.sub(r'\w+\d+_t', '', v))  # remove types of form int8_t
 		def_df['value'] = def_df['value'].apply(lambda v: re.sub(r'\(\)', '', v))  # remove parentheses with empty content ()
-
-		# Select keys by given prefix:
-		fpr = 'LL_'  # prefix to filter defines for
-		visit_idx:int = 0
-		def_df['visit-idx'] = def_df['key'].apply(
-			lambda k: visit_idx if k.startswith(fpr) else not_visit_idx)
-
-		# Visit each sub-key while counting visit steps:
-		keys2visit = [None]*2  # provide list with fake length for the start
-		while len(keys2visit) > 0:
-			# Split value by operator and drop starting with digit:
-			def_df['val-split-op'] = def_df.loc[def_df['visit-idx'] == visit_idx, 'value']\
-				.apply(lambda v: [k for k in gen_dts_defines._split_val_by_opertor(v) \
-									if not k[0].isdigit()])
-
-			# Determine keys to be visited:
-			keys2visit = sorted(set(itertools.chain.from_iterable(def_df['val-split-op'].dropna())))
-			visit_idx += 1
-
-			# Mark keys2visit by new visit_idx:
-			def_df.loc[def_df['key'].isin(keys2visit), 'visit-idx'] = visit_idx
-		def_df = def_df[def_df['visit-idx'] != not_visit_idx]  # select all visited rows
+		def_df['value'] = def_df['value'].apply(lambda v: re.sub(r'\(\*\)', '', v))  # remove parentheses with empty content (*)
+		def_df['value'] = def_df['value'].apply(lambda v: re.sub(r'\([^(].*\*\)', '', v))  # remove parentheses with pointer content (e.g. (ADC_TypeDef *))
 
 		# For all numeric characters in value column remove non-digit values in numbers:
 		def_df['val-split-op'] = def_df['value'].apply(
-			lambda v: gen_dts_defines._split_val_by_opertor(v))
+			lambda v: gen_dts_defines._split_val_by_operator(v))
 
 		def_df['val-split-op-replacement'] = def_df['val-split-op'].apply(
 			lambda val_list: [gen_dts_defines._format_numeric(v) for v in val_list])
@@ -167,16 +145,22 @@ class gen_dts_defines:
 				gen_dts_defines._replace_in_str(row['value'], row['val-split-op'],
 												row['val-split-op-replacement']), axis=1)
 
+		# Remove all brackets from value column if there are no operators inside:
+		op_list = ['+', '-', '*', '/', '%', '<<', '>>', '&', '|', '^']
+		def_df['value'] = def_df['value'].apply(
+			lambda v: v[1:-1] if v.startswith('(') and v.endswith(')') and \
+						all(op not in v for op in op_list) else v)
+
+		# Remove all defines with value starting with _ (usually used for internal purposes):
+		def_df = def_df[~def_df['value'].str.startswith('_')]
+
 		# Overwrite line column with cleaned values:
 		def_df['line'] = def_df.apply(lambda row: f"#define {row['key']} {row['value']}\n", axis=1)
-
-		# Sort and reindex:
 		def_df.sort_values('key', inplace=True)
-		def_df.reset_index(drop=True, inplace=True)  # reindex in place
+		def_df.reset_index(drop=True, inplace=True)
 
-		# Use following two lines for debug purposes only:
-		# logger.info(f"\n{def_df[['visit-idx', 'key', 'value', 'val-split-op', 'val-split-op-replacement', 'line']]}")
-		# assert False, '---> STOP <---'
+		# Use following line for debug purposes only:
+		# logger.info(f"\n{def_df}"); assert False, '---> STOP <---'
 
 		return def_df
 
@@ -201,12 +185,10 @@ class gen_dts_defines:
 		return v_ret
 
 	@staticmethod
-	def _split_val_by_opertor(v):
+	def _split_val_by_operator(v:str) -> list[str]:
 		operators = ['(', ')', '+', '-', '*', '/', '%', '<<', '>>', '&', '|', '^']
-		v_clean = v
-		for op in operators: v_clean = v_clean.replace(op, ' ')
-		v_clean = v_clean.split()
-		return v_clean
+		for op in operators: v = v.replace(op, ' ')
+		return v.split()
 
 	@staticmethod
 	def _store_def(logger: logging.Logger, file_path: str, def_dump_df: pd.DataFrame):
@@ -273,7 +255,8 @@ class gen_dts_defines:
 							dest_dir: str,
 							series: str, soc: list,
 							defines_list: list,
-							include_path_list: list) -> list:
+							include_path_list: list,
+							tmp_include_dir: str) -> list:
 		start_time = datetime.now()
 		series_dest_path = os.path.join(dest_dir, series, 'drivers', 'include')
 		logger.debug(f'Use series destination folder: {series_dest_path}')
@@ -282,25 +265,36 @@ class gen_dts_defines:
 		logger.info(f'Processing SoC {soc}')
 		logger.debug(f"Found headers (SoC: {soc}):\n\t{'\n\t'.join(input_files_list)}")
 		full_soc_name = f'STM32{soc}'
-		make_cmd_fn = lambda input_file: [compiler, '-dM', '-E', '-P', input_file] + \
-											defines_list + include_path_list
+
+		input_file_defines_list = []
 		for input_file in input_files_list:
-			cmd = make_cmd_fn(input_file)
-			cmd_str = ' '.join(cmd)
-			logger.debug(f'Execute command ({full_soc_name}): {cmd_str}')
-			result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-			result_file_name_prefix = os.path.splitext(os.path.basename(input_file))[0]
-			def_dump_df = gen_dts_defines._filter_defines_dump(logger, result.stdout)
-			result_file_name = f'{result_file_name_prefix}_{full_soc_name.lower()}_def.dtsi'
-			result_file = os.path.join(series_dest_path, result_file_name)
-			gen_dts_defines._store_def(logger, result_file, def_dump_df)
-			if len(result.stderr):
-				logger.error(f'Command error (SoC: {full_soc_name}):\n{result.stderr}\nExecuted command: {cmd_str}\n')
-				continue
-			# TODO: Not all sub-series have all the peripherals, so the main include
-			# file may include non-existing files. Need to filter out non-existing files.
-			main_include_file = os.path.join(series_dest_path, f'{result_file_name_prefix}_def.dtsi')
-			# self._create_main_include(main_include_file, soc_list)
+			input_file_defines_list.append(f'#include \"{input_file}\"\n')
+
+		main_defines_file = os.path.join(tmp_include_dir, f'{full_soc_name}_main_include.h')
+		with open(main_defines_file, 'w') as f:
+			f.writelines(input_file_defines_list)
+			logger.debug(f'Created main defines file (SoC: {full_soc_name}): {main_defines_file}')
+
+		cmd = [compiler, '-dM', '-E', '-P', main_defines_file] + \
+			defines_list + include_path_list
+		cmd_str = ' '.join(cmd)
+		logger.debug(f'Execute command ({full_soc_name}): {cmd_str}')
+		result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+		logger.debug(f'Command output (SoC: {full_soc_name}):\n{result.stdout}')
+		# TODO: In input_file parse all #define entries (could be multiline too) and
+		# mark them as a 0-visit entry in the def_df data frame to start processing with.
+		def_dump_df = gen_dts_defines._filter_defines_dump(logger, result.stdout)
+		logger.debug(f'Filtered defines (SoC: {full_soc_name}):\n{def_dump_df}')
+		result_file_name = f'{full_soc_name.lower()}_def.dtsi'
+		result_file = os.path.join(series_dest_path, result_file_name)
+		gen_dts_defines._store_def(logger, result_file, def_dump_df)
+		if len(result.stderr):
+			logger.warning(f'Executed command (SoC: {full_soc_name}): {cmd_str}\nGenerated:\n{result.stderr}\n\n')
+		# TODO: Not all sub-series have all the peripherals, so the main include
+		# file may include non-existing files. Need to filter out non-existing files.
+		# main_include_file = os.path.join(series_dest_path, f'{result_file_name_prefix}_def.dtsi')
+		# self._create_main_include(main_include_file, soc_list)
+
 		elapsed_time = (datetime.now() - start_time).total_seconds()
 		logger.info(f'Completed SoC {soc} processing in {elapsed_time} sec.')
 		return []
@@ -322,11 +316,11 @@ class gen_dts_defines:
 			'core_cm0', 'core_cm0plus', 'core_cm3', 'core_cm4', 'core_cm7',
 			'core_cm33', 'core_cm55', 'core_cm85',
 			'core_ca']
-		self._core_headers_tmp_dir = tempfile.mkdtemp(
+		self._headers_tmp_dir = tempfile.mkdtemp(
 			prefix=f'stm32_includes_{self.__class__.__name__.lower()}_')
-		self._lg.info(f'Created temp folder {self._core_headers_tmp_dir}')
+		self._lg.info(f'Created temp folder {self._headers_tmp_dir}')
 		for cpu_name in cpu_list:
-			header_path = os.path.join(self._core_headers_tmp_dir, cpu_name + '.h')
+			header_path = os.path.join(self._headers_tmp_dir, cpu_name + '.h')
 			with open(header_path, 'w', encoding='utf-8'): pass
 			self._lg.debug(f'Created empty cpu-header: {header_path}')
 
@@ -340,7 +334,7 @@ class gen_dts_defines:
 			lambda row: [
 				os.path.join(self._stm32cube_path, f'stm32{row["series"]}xx', 'drivers', 'include'),
 				os.path.join(self._stm32cube_path, f'stm32{row["series"]}xx', 'soc'),
-				self._core_headers_tmp_dir], axis=1)
+				self._headers_tmp_dir], axis=1)
 		self._stm32_series_df['include-path-list'] = self._stm32_series_df['include-path-list'].apply(
 			lambda x: sorted(set([f'-I{path}' for path in x])))
 
@@ -359,7 +353,8 @@ class gen_dts_defines:
 			lambda row: threading.Thread(target=self._run_series_processing,
 				args=(self._lg, self._compiler, row['input-files-list'],
 					self._dest_path, row['series'], row['soc'],
-					row['defines'], row['include-path-list'])), axis=1)
+					row['defines'], row['include-path-list'],
+					self._headers_tmp_dir)), axis=1)
 		self._stm32_series_df.reset_index(drop=True, inplace=True)
 		self._lg.debug(self._stm32_series_df)
 
